@@ -1,6 +1,6 @@
 [package]
 name = "sbvc-gtk"
-description = "A frontent for SBVC"
+description = "A frontend for SBVC"
 repository = "https://github.com/Daniikk1012/sbvc-gtk"
 version = "0.1.0"
 edition = "2021"
