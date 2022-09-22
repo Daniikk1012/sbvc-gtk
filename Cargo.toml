@@ -2,12 +2,11 @@
 name = "sbvc-gtk"
 description = "A frontend for SBVC"
 repository = "https://github.com/Daniikk1012/sbvc-gtk"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-async-std = "1.10"
-futures = "0.3"
-sbvc_lib = "0.3"
+sbvc_lib = "0.5"
 gtk4 = "0.4"
+chrono = "0.4"

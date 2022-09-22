@@ -1,33 +1,32 @@
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
-
-use async_std::{
-    sync::RwLock,
-    task::{self, JoinHandle},
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
 };
-use futures::{channel::mpsc, join};
+
+use chrono::{DateTime, Utc};
 use gtk4::{
-    glib::{self, clone, MainContext},
-    prelude::*,
+    glib::{self, clone},
+    prelude::{ApplicationExt, ApplicationExtManual, Cast, FileExt},
+    traits::{
+        BoxExt, ButtonExt, DialogExt, EditableExt, EntryExt, FileChooserExt,
+        GridExt, GtkWindowExt, NativeDialogExt, WidgetExt,
+    },
     Align, Application, ApplicationWindow, Button, Entry, FileChooserAction,
-    FileChooserNative, Grid, Inhibit, Label, MessageDialog, MessageType,
+    FileChooserNative, FileFilter, Grid, Label, MessageDialog, MessageType,
     Orientation, ResponseType, ScrolledWindow, Widget,
 };
-use sbvc_lib::{Database, Version};
+use sbvc_lib::{Sbvc, Version};
 
 fn main() {
     let application =
         Application::builder().application_id("com.wgsoft.app.sbvc").build();
-
     application.connect_activate(build_ui);
-
     application.run();
 }
 
 fn build_ui(application: &Application) {
-    let database: Arc<RwLock<Option<Database>>> = Arc::new(RwLock::new(None));
-    let version: Arc<RwLock<Option<Version>>> = Arc::new(RwLock::new(None));
-    let handle: Rc<RefCell<Option<JoinHandle<()>>>> =
-        Rc::new(RefCell::new(None));
+    let sbvc: Rc<RefCell<Option<Sbvc>>> = Rc::new(RefCell::new(None));
+    let selected = Rc::new(Cell::new(0u32));
 
     let window = ApplicationWindow::builder()
         .application(application)
@@ -36,28 +35,67 @@ fn build_ui(application: &Application) {
         .default_height(540)
         .build();
 
-    window.connect_close_request(
-        clone!(@strong database, @strong handle => move |_| {
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
-            }
-
-            task::block_on(clone!(@weak database => async move {
-                let mut write = database.write().await;
-
-                if let Some(database) = write.take() {
-                    database.close().await;
-                }
-            }));
-
-            Inhibit(false)
-        }),
-    );
-
     let main_box =
         gtk4::Box::builder().orientation(Orientation::Vertical).build();
 
     let top_box = gtk4::Box::builder()
+        .orientation(Orientation::Horizontal)
+        .hexpand(true)
+        .build();
+
+    let path_label = Label::builder()
+        .label("No file selected")
+        .hexpand(true)
+        .xalign(0.0)
+        .build();
+    path_label.set_margin_default();
+    top_box.append(&path_label);
+
+    let filter = FileFilter::new();
+    filter.add_pattern("*.sbvc");
+
+    let path_chooser = FileChooserNative::builder()
+        .title("Select SBVC file to open")
+        .transient_for(&window)
+        .modal(true)
+        .action(FileChooserAction::Open)
+        .select_multiple(false)
+        .accept_label("Open")
+        .cancel_label("Cancel")
+        .filter(&filter)
+        .build();
+
+    let select_path_button = Button::builder().label("Open").build();
+    select_path_button.set_margin_default();
+    select_path_button.connect_clicked(
+        clone!(@strong path_chooser => move |_| {
+            path_chooser.show();
+        }),
+    );
+    top_box.append(&select_path_button);
+
+    let file_chooser = FileChooserNative::builder()
+        .title("Select file to be tracked")
+        .transient_for(&window)
+        .modal(true)
+        .action(FileChooserAction::Open)
+        .select_multiple(false)
+        .accept_label("Open")
+        .cancel_label("Cancel")
+        .build();
+
+    let select_file_button = Button::builder().label("New").build();
+    select_file_button.set_margin_default();
+    select_file_button.connect_clicked(
+        clone!(@strong file_chooser => move |_| {
+            file_chooser.show();
+        }),
+    );
+    top_box.append(&select_file_button);
+
+    main_box.append(&top_box);
+
+    let file_box = gtk4::Box::builder()
         .orientation(Orientation::Horizontal)
         .hexpand(true)
         .build();
@@ -68,10 +106,10 @@ fn build_ui(application: &Application) {
         .xalign(0.0)
         .build();
     file_label.set_margin_default();
-    top_box.append(&file_label);
+    file_box.append(&file_label);
 
-    let file_chooser = FileChooserNative::builder()
-        .title("Select file to open")
+    let rename_chooser = FileChooserNative::builder()
+        .title("Select file to be tracked")
         .transient_for(&window)
         .modal(true)
         .action(FileChooserAction::Open)
@@ -80,16 +118,19 @@ fn build_ui(application: &Application) {
         .cancel_label("Cancel")
         .build();
 
-    let select_file_button = Button::builder().label("Browse").build();
-    select_file_button.set_margin_default();
-    select_file_button.connect_clicked(
-        clone!(@strong file_chooser => move |_| {
-            file_chooser.show();
+    let select_rename_button =
+        Button::builder().label("Change tracked file").build();
+    select_rename_button.set_margin_default();
+    select_rename_button.connect_clicked(
+        clone!(@strong sbvc, @strong rename_chooser => move |_| {
+            if sbvc.borrow().is_some() {
+                rename_chooser.show();
+            }
         }),
     );
-    top_box.append(&select_file_button);
+    file_box.append(&select_rename_button);
 
-    main_box.append(&top_box);
+    main_box.append(&file_box);
 
     let bottom_box = gtk4::Box::builder()
         .orientation(Orientation::Horizontal)
@@ -147,67 +188,194 @@ fn build_ui(application: &Application) {
     insertions_label.set_margin_default();
     side_box.append(&insertions_label);
 
-    let callback = clone!(@strong version => move || {
-        let (id, base_id, base_name, name, date, deletions, insertions) =
-            task::block_on(async {
-                let read = version.read().await;
-                let version = read.as_ref().unwrap();
-                let base = version.base().await;
+    let rollback_dialog = MessageDialog::builder()
+        .title("Rollback?")
+        .text(
+            "You have uncommited changes in your file. \
+            Do you wish to discard them?",
+        )
+        .transient_for(&window)
+        .modal(true)
+        .message_type(MessageType::Warning)
+        .buttons(gtk4::ButtonsType::YesNo)
+        .build();
+    rollback_dialog.connect_response(clone!(
+        @weak sbvc,
+        @strong selected,
+        @weak scrolled_grid,
+    => move |delete_dialog, response| {
+        sbvc.borrow_mut()
+            .as_mut()
+            .unwrap()
+            .checkout(
+                selected.get(),
+                response == ResponseType::Yes,
+            )
+            .unwrap();
 
-                let (base_id, base_name) = if let Some(base) = base {
-                    let (base_id, base_name) = join!(base.id(), base.name());
-                    (Some(base_id), Some(base_name))
-                } else {
-                    (None, None)
-                };
+        delete_dialog.hide();
+    }));
 
-                let (id, name, date, deletions, insertions) = join!(
-                    version.id(),
-                    version.name(),
-                    version.date(),
-                    version.deletions(),
-                    version.insertions(),
-                );
-
-                (id, base_id, base_name, name, date, deletions, insertions)
-            });
-
-        id_label.set_label(&format!("Version ID: {}", id));
-
-        if let (Some(base_id), Some(base_name)) = (base_id, base_name) {
-            base_label.set_label(
-                &format!("Base version: {}: {}", base_id, base_name),
-            );
-        } else {
-            base_label.set_label(&format!("Base version: None"));
-        }
-
-        name_label.set_label(&format!("Version name: {}", name));
-        date_label.set_label(&format!("Commit date: {}", date));
-        deletions_label.set_label(&format!("Deleteion count: {}", deletions));
-        insertions_label.set_label(&format!("Insertion count: {}", insertions));
+    let callback = clone!(
+        @weak sbvc,
+        @weak id_label,
+        @weak base_label,
+        @weak name_label,
+        @weak date_label,
+        @weak deletions_label,
+        @weak insertions_label,
+    => move || {
+        let borrow = sbvc.borrow();
+        let version = borrow.as_ref().unwrap().current();
+        id_label.set_text(&format!("Version ID: {}", version.id()));
+        base_label.set_text(&format!("Version base: {}", version.base()));
+        name_label.set_text(&format!("Version name: {}", version.name()));
+        date_label.set_text(&format!(
+            "Commit date: {}",
+            DateTime::<Utc>::from(version.date()).to_rfc2822(),
+        ));
+        deletions_label.set_text(&format!(
+            "Deletion count: {}",
+            version.difference().deletions.len()
+        ));
+        insertions_label.set_text(&format!(
+            "Insertion count: {}",
+            version.difference().insertions.len(),
+        ));
     });
 
-    file_chooser.connect_response(clone!(
+    path_chooser.connect_response(clone!(
+        @weak sbvc,
+        @weak selected,
+        @strong rollback_dialog,
         @strong callback,
-        @weak handle,
-        @weak database,
-        @weak version,
+        @weak path_label,
+        @weak file_label,
+        @weak scrolled_grid
+    => move |path_chooser, response| {
+        if let ResponseType::Accept = response {
+            let path = path_chooser.file().unwrap().path().unwrap();
+
+            path_label.set_label(
+                &format!("Selected SBVC file: {}", path.to_string_lossy()),
+            );
+
+            *sbvc.borrow_mut() = Sbvc::open(path).ok();
+
+            file_label.set_label(&format!(
+                "Tracked file: {}",
+                sbvc.borrow().as_ref().unwrap().file().to_string_lossy(),
+            ));
+
+            for child in scrolled_grid.observe_children() {
+                scrolled_grid.remove(
+                    &child.dynamic_cast::<Widget>().unwrap(),
+                );
+            }
+
+            build_tree(
+                &scrolled_grid,
+                0,
+                &mut 0,
+                sbvc.clone(),
+                selected,
+                &rollback_dialog,
+                callback.clone(),
+                sbvc.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .versions()
+                    .iter()
+                    .find(|&version| version.id() == version.base())
+                    .unwrap(),
+            );
+
+            callback();
+        }
+    }));
+
+    file_chooser.connect_response(clone!(
+        @weak sbvc,
+        @weak selected,
+        @weak rollback_dialog,
+        @strong callback,
+        @weak path_label,
+        @weak file_label,
         @weak scrolled_grid,
     => move |file_chooser, response| {
         if let ResponseType::Accept = response {
-            let path = file_chooser.file()
-                .unwrap()
-                .path()
-                .unwrap();
+            let file = file_chooser.file().unwrap().path().unwrap();
 
-            file_label.set_label(&format!(
-                "Selected file: {}",
-                path.to_string_lossy(),
+            path_label.set_label(&format!(
+                "Selected SBVC file: {}",
+                file.with_extension("sbvc").to_string_lossy(),
             ));
+            file_label.set_label(
+                &format!("Tracked file: {}", file.to_string_lossy()),
+            );
 
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
+            *sbvc.borrow_mut() =
+                Sbvc::new(file.with_extension("sbvc"), file).ok();
+
+            for child in scrolled_grid.observe_children() {
+                scrolled_grid.remove(
+                    &child.dynamic_cast::<Widget>().unwrap(),
+                );
+            }
+
+            build_tree(
+                &scrolled_grid,
+                0,
+                &mut 0,
+                sbvc.clone(),
+                selected,
+                &rollback_dialog,
+                callback.clone(),
+                sbvc.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .versions()
+                    .iter()
+                    .find(|&version| version.id() == version.base())
+                    .unwrap(),
+            );
+
+            callback();
+        }
+    }));
+
+    rename_chooser.connect_response(clone!(
+        @weak sbvc,
+        @weak path_label,
+        @weak file_label,
+        @weak scrolled_grid
+    => move |rename_chooser, response| {
+        if let ResponseType::Accept = response {
+            let file = rename_chooser.file().unwrap().path().unwrap();
+
+            file_label.set_label(
+                &format!("Tracked file: {}", file.to_string_lossy()),
+            );
+
+            sbvc.borrow_mut().as_mut().unwrap().set_file(file).unwrap();
+        }
+    }));
+
+    let commit_button =
+        Button::builder().label("Commit").halign(Align::Fill).build();
+    commit_button.set_margin_default();
+    commit_button.connect_clicked(clone!(
+        @weak sbvc,
+        @weak selected,
+        @weak rollback_dialog,
+        @strong callback,
+        @weak scrolled_grid,
+    => move |_| {
+        if sbvc.borrow().is_some() {
+            let mut borrow = sbvc.borrow_mut();
+
+            if let Some(sbvc) = borrow.as_mut() {
+                sbvc.commit().unwrap();
             }
 
             for child in scrolled_grid.observe_children() {
@@ -216,128 +384,28 @@ fn build_ui(application: &Application) {
                 );
             }
 
-            let (mut sender, mut reciever) = mpsc::channel(4);
+            drop(borrow);
 
-            *handle.borrow_mut() = Some(task::spawn(
-                clone!(@weak database, @weak version => async move {
-                    let mut write = database.write().await;
+            build_tree(
+                &scrolled_grid,
+                0,
+                &mut 0,
+                sbvc.clone(),
+                selected,
+                &rollback_dialog,
+                callback.clone(),
+                sbvc.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .versions()
+                    .iter()
+                    .find(|&version| version.id() == version.base())
+                    .unwrap(),
+            );
 
-                    if let Some(database) = write.take() {
-                        if database.path() != path {
-                            database.close().await;
-
-                            *write = Some(Database::new(path).await.unwrap());
-                        } else {
-                            *write = Some(database);
-                        }
-                    } else {
-                        *write = Some(
-                            Database::new(path).await.unwrap(),
-                        );
-                    }
-
-                    let database = write.as_ref().unwrap().clone();
-                    *version.write().await = Some(database.versions());
-                    sender.start_send(database.clone()).unwrap();
-                })
-            ));
-
-            MainContext::default().spawn_local(clone!(
-                @strong callback,
-                @weak version,
-                @weak scrolled_grid,
-            => async move {
-                loop {
-                    if let Ok(Some(database))
-                        = reciever.try_next()
-                    {
-                        build_tree(
-                            &scrolled_grid,
-                            0,
-                            &mut 0,
-                            database.versions(),
-                            version.clone(),
-                            &callback,
-                        );
-
-                        callback();
-
-                        break;
-                    }
-
-                    task::sleep(Duration::from_millis(10)).await;
-                }
-            }));
+            callback();
         }
     }));
-
-    let commit_button =
-        Button::builder().label("Commit").halign(Align::Fill).build();
-    commit_button.set_margin_default();
-    commit_button.connect_clicked(clone!(
-        @strong callback,
-        @weak handle,
-        @weak database,
-        @weak version,
-        @weak scrolled_grid
-    => move |_| {
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
-            }
-
-            let (mut sender, mut receiver) = mpsc::channel(4);
-
-            *handle.borrow_mut() = Some(task::spawn(
-                clone!(@weak database, @weak version => async move {
-                    let read = version.read().await;
-
-                    if let Some(version) = read.as_ref() {
-                        version.commit().await.unwrap();
-
-                        sender
-                            .start_send(
-                                database.read().await.as_ref().unwrap().clone(),
-                            )
-                            .unwrap();
-                    }
-                }),
-            ));
-
-            MainContext::default().spawn_local(
-                clone!(@strong callback, @weak version, @weak scrolled_grid =>
-                    async move {
-                        loop {
-                            if let Ok(option) = receiver.try_next() {
-                                if let Some(database) = option {
-                                    for child
-                                        in scrolled_grid.observe_children()
-                                    {
-                                        scrolled_grid.remove(
-                                            &child
-                                                .dynamic_cast::<Widget>()
-                                                .unwrap(),
-                                        );
-                                    }
-
-                                    build_tree(
-                                        &scrolled_grid,
-                                        0,
-                                        &mut 0,
-                                        database.versions(),
-                                        version.clone(),
-                                        &callback,
-                                    );
-                                }
-
-                                break;
-                            }
-
-                            task::sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                ),
-            );
-        }));
     side_box.append(&commit_button);
 
     let rename_dialog = MessageDialog::builder()
@@ -357,71 +425,41 @@ fn build_ui(application: &Application) {
     rename_dialog.content_area().append(&rename_entry);
 
     rename_dialog.connect_response(clone!(
+        @weak sbvc,
+        @weak selected,
+        @weak rollback_dialog,
         @strong callback,
-        @weak handle,
-        @weak database,
-        @weak version,
         @weak scrolled_grid,
     => move |rename_dialog, response| {
-        if response == ResponseType::Ok {
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
+        if response == ResponseType::Ok && sbvc.borrow().is_some() {
+            if let Some(sbvc) = sbvc.borrow_mut().as_mut() {
+                sbvc.rename(&rename_entry.text()).unwrap();
             }
 
-            let (mut sender, mut receiver) = mpsc::channel(4);
+            for child in scrolled_grid.observe_children() {
+                scrolled_grid.remove(
+                    &child.dynamic_cast::<Widget>().unwrap(),
+                );
+            }
 
-            let name = rename_entry.text().to_string();
-
-            *handle.borrow_mut() =
-                Some(task::spawn(clone!(@weak version => async move {
-                    let read = version.read().await;
-
-                    if let Some(version) = read.as_ref() {
-                        version.rename(name).await.unwrap();
-                        sender
-                            .start_send(
-                                database.read().await.as_ref().unwrap().clone(),
-                            )
-                            .unwrap();
-                    }
-                })));
-
-            MainContext::default().spawn_local(
-                clone!(@strong callback, @weak version, @weak scrolled_grid =>
-                    async move {
-                        loop {
-                            if let Ok(option) = receiver.try_next() {
-                                if let Some(database) = option {
-                                    for child
-                                        in scrolled_grid.observe_children()
-                                    {
-                                        scrolled_grid.remove(
-                                            &child
-                                                .dynamic_cast::<Widget>()
-                                                .unwrap(),
-                                        );
-                                    }
-
-                                    build_tree(
-                                        &scrolled_grid,
-                                        0,
-                                        &mut 0,
-                                        database.versions(),
-                                        version.clone(),
-                                        &callback,
-                                    );
-
-                                    callback();
-                                }
-
-                                break;
-                            }
-
-                            task::sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                ),
+            build_tree(
+                &scrolled_grid,
+                0,
+                &mut 0,
+                sbvc.clone(),
+                selected,
+                &rollback_dialog,
+                callback.clone(),
+                sbvc.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .versions()
+                    .iter()
+                    .find(|&version| version.id() == version.base())
+                    .unwrap(),
             );
+
+            callback();
         }
 
         rename_entry.set_text("");
@@ -436,108 +474,53 @@ fn build_ui(application: &Application) {
     }));
     side_box.append(&rename_button);
 
-    let rollback_button =
-        Button::builder().label("Roll back").halign(Align::Fill).build();
-    rollback_button.set_margin_default();
-    rollback_button.connect_clicked(clone!(@weak handle, @weak version =>
-        move |_| {
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
-            }
-
-            *handle.borrow_mut() = Some(task::spawn(clone!(@weak version =>
-                async move {
-                    let read = version.read().await;
-
-                    if let Some(version) = read.as_ref() {
-                        version.rollback().await.unwrap();
-                    }
-                }
-            )));
-        }
-    ));
-    side_box.append(&rollback_button);
-
     let delete_dialog = MessageDialog::builder()
         .title("Delete version")
-        .text("Are you sure you want to delete the selected version?")
+        .text(
+            "Are you sure you want to delete the selected version? Your file \
+            content will be set to the one of the base of the deleted version",
+        )
         .transient_for(&window)
         .modal(true)
         .message_type(MessageType::Warning)
         .buttons(gtk4::ButtonsType::YesNo)
         .build();
     delete_dialog.connect_response(clone!(
+        @weak sbvc,
+        @weak selected,
+        @weak rollback_dialog,
         @strong callback,
-        @weak handle,
-        @weak database,
-        @weak version,
         @weak scrolled_grid,
     => move |delete_dialog, response| {
-        if response == ResponseType::Yes {
-            if let Some(handle) = handle.borrow_mut().as_mut() {
-                task::block_on(handle);
+        if response == ResponseType::Yes && sbvc.borrow().is_some() {
+            if let Some(sbvc) = sbvc.borrow_mut().as_mut() {
+                sbvc.delete().unwrap();
             }
 
-            let (mut sender, mut receiver) = mpsc::channel(4);
+            for child in scrolled_grid.observe_children() {
+                scrolled_grid.remove(
+                    &child.dynamic_cast::<Widget>().unwrap(),
+                );
+            }
 
-            *handle.borrow_mut() = Some(task::spawn(
-                clone!(@weak database, @weak version => async move {
-                    let mut write = version.write().await;
-
-                    if let Some(version) = write.as_mut() {
-                        if let Some(base) = version.base().await {
-                            version.delete().await.unwrap();
-                            *version = base;
-                            sender
-                                .start_send(
-                                    database.read()
-                                        .await
-                                        .as_ref()
-                                        .unwrap()
-                                        .clone(),
-                                )
-                                .unwrap();
-                        }
-                    }
-                }),
-            ));
-
-            MainContext::default().spawn_local(
-                clone!(@strong callback, @weak version, @weak scrolled_grid =>
-                    async move {
-                        loop {
-                            if let Ok(option) = receiver.try_next() {
-                                if let Some(database) = option {
-                                    for child
-                                        in scrolled_grid.observe_children()
-                                    {
-                                        scrolled_grid.remove(
-                                            &child
-                                                .dynamic_cast::<Widget>()
-                                                .unwrap(),
-                                        );
-                                    }
-
-                                    build_tree(
-                                        &scrolled_grid,
-                                        0,
-                                        &mut 0,
-                                        database.versions(),
-                                        version.clone(),
-                                        &callback,
-                                    );
-
-                                    callback();
-                                }
-
-                                break;
-                            }
-
-                            task::sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                ),
+            build_tree(
+                &scrolled_grid,
+                0,
+                &mut 0,
+                sbvc.clone(),
+                selected,
+                &rollback_dialog,
+                callback.clone(),
+                sbvc.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .versions()
+                    .iter()
+                    .find(|&version| version.id() == version.base())
+                    .unwrap(),
             );
+
+            callback();
         }
 
         delete_dialog.hide();
@@ -560,45 +543,69 @@ fn build_ui(application: &Application) {
     window.present();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_tree<F: 'static + Fn() + Clone>(
     grid: &Grid,
     grid_width: i32,
     grid_height: &mut i32,
-    version: Version,
-    selected: Arc<RwLock<Option<Version>>>,
-    callback: &F,
+    sbvc: Rc<RefCell<Option<Sbvc>>>,
+    selected: Rc<Cell<u32>>,
+    rollback_dialog: &MessageDialog,
+    callback: F,
+    version: &Version,
 ) {
-    let (id, name, children) = task::block_on(async {
-        join!(
-            version.id(),
-            async { version.name().await.to_string() },
-            version.children(),
-        )
-    });
+    let id = version.id();
 
-    let button = Button::builder().label(&format!("{}: {}", id, name)).build();
+    let button =
+        Button::builder().label(&format!("{}: {}", id, version.name())).build();
+    button.connect_clicked(clone!(
+        @weak sbvc,
+        @weak selected,
+        @weak rollback_dialog,
+        @strong callback
+    => move |_| {
+        if sbvc.borrow()
+            .as_ref()
+            .unwrap()
+            .is_changed()
+            .unwrap()
+        {
+            selected.set(id);
+            rollback_dialog.show();
+        } else {
+            sbvc.borrow_mut().as_mut().unwrap().checkout(id, true).unwrap();
+            callback();
+        }
+    }));
 
     grid.attach(&button, grid_width, *grid_height, 1, 1);
 
-    if children.len() > 0 {
-        for child in children {
-            build_tree(
-                grid,
-                grid_width + 1,
-                grid_height,
-                child,
-                selected.clone(),
-                callback,
-            );
-        }
-    } else {
-        *grid_height += 1;
+    let mut found = false;
+
+    for child in sbvc
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .versions()
+        .iter()
+        .filter(|&child| child.base() == id && child.id() != id)
+    {
+        build_tree(
+            grid,
+            grid_width + 1,
+            grid_height,
+            sbvc.clone(),
+            selected.clone(),
+            rollback_dialog,
+            callback.clone(),
+            child,
+        );
+        found = true;
     }
 
-    button.connect_clicked(clone!(@strong callback => move |_| {
-        *task::block_on(selected.write()) = Some(version.clone());
-        callback();
-    }));
+    if !found {
+        *grid_height += 1;
+    }
 }
 
 trait SetMargin {
