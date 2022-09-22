@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "sbvc-gtk"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "gtk4",
@@ -638,9 +638,9 @@ dependencies = [
 
 [[package]]
 name = "sbvc_lib"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4da60eb04a17c5bf236081059865d62f0aae3af8e508a981fd966fbfa1fb54ce"
+checksum = "7e526c067840d887be081d6227553d16b523ce8cea7ef823ff0fcbb3d3968e33"
 dependencies = [
  "nelf",
  "wgdiff",
